@@ -1337,6 +1337,10 @@ ReplyUPtr RedisCluster::_command(Cmd cmd, const StringView &key, Args &&...args)
             SafeConnection safe_connection(*pool);
 
             return _command(cmd, safe_connection.connection(), std::forward<Args>(args)...);
+        } catch (const SlotCoverageError &err) {
+            // Some slot is not covered, update to see if new node added.
+            // Check https://github.com/sewenew/redis-plus-plus/issues/255 for detail.
+            _pool.update();
         } catch (const IoError &err) {
             // When master is down, one of its replicas will be promoted to be the new master.
             // If we try to send command to the old master, we'll get an *IoError*.

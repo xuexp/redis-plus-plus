@@ -25,6 +25,7 @@
 #include "reply.h"
 #include "connection_pool.h"
 #include "shards.h"
+#include "errors.h"
 
 namespace sw {
 
@@ -112,6 +113,11 @@ private:
     Role _role = Role::MASTER;
 
     static const std::size_t SHARDS = 16383;
+};
+
+class SlotCoverageError : public Error {
+public:
+    explicit SlotCoverageError(Slot slot) : Error("slot is not covered: " + std::to_string(slot)) {}
 };
 
 }
