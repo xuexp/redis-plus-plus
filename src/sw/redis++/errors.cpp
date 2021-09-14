@@ -45,7 +45,7 @@ void throw_error(const redisContext &context, const std::string &err_info) {
         throw Error(err_info + ": null error message: " + std::to_string(err_code));
     }
 
-    auto err_msg = err_info + ": " + err_str;
+    auto err_msg = err_info + ": " + err_str + ", " + std::to_string(err_code) + ", " + std::to_string(errno);
 
     switch (err_code) {
     case REDIS_ERR_IO:
