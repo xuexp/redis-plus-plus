@@ -90,20 +90,19 @@ inline FormattedCommand format_cmd(int argc, const char **argv, const std::size_
     char *data = nullptr;
     auto len = redisFormatCommandArgv(&data, argc, argv, argv_len);
 
-    return FormattedCommand(data, len);
+    return FormattedCommand(data, static_cast<int>(len));
 }
 
 inline FormattedCommand format_cmd(CmdArgs &args) {
     char *data = nullptr;
-    auto len = redisFormatCommandArgv(&data, args.size(), args.argv(), args.argv_len());
+    auto len = redisFormatCommandArgv(&data, static_cast<int>(args.size()), args.argv(), args.argv_len());
 
-    return FormattedCommand(data, len);
+    return FormattedCommand(data, static_cast<int>(len));
 }
 
 struct SetResultParser {
     bool operator()(redisReply &reply) const {
-        sw::redis::reply::rewrite_set_reply(reply);
-        return sw::redis::reply::parse<bool>(reply);
+        return sw::redis::reply::parse_set_reply(reply);
     }
 };
 
@@ -200,6 +199,12 @@ FormattedCommand unlink_range(Input first, Input last) {
 
 // STRING commands.
 
+inline FormattedCommand append(const StringView &key, const StringView &str) {
+    return format_cmd("APPEND %b %b",
+            key.data(), key.size(),
+            str.data(), str.size());
+}
+
 inline FormattedCommand get(const StringView &key) {
     return format_cmd("GET %b", key.data(), key.size());
 }
@@ -249,6 +254,22 @@ inline FormattedCommand set(const StringView &key,
 
     if (ttl > std::chrono::milliseconds(0)) {
         args << "PX" << ttl.count();
+    }
+
+    cmd::detail::set_update_type(args, type);
+
+    return format_cmd(args);
+}
+
+inline FormattedCommand set_keepttl(const StringView &key,
+        const StringView &val,
+        bool keepttl,
+        UpdateType type) {
+    CmdArgs args;
+    args << "SET" << key << val;
+
+    if (keepttl) {
+        args << "KEEPTTL";
     }
 
     cmd::detail::set_update_type(args, type);
@@ -762,6 +783,78 @@ FormattedCommand evalsha(const StringView &script,
     args << "EVALSHA" << script << keys_num
             << std::make_pair(keys_first, keys_last)
             << std::make_pair(args_first, args_last);
+
+    return format_cmd(args);
+}
+
+// PUBSUB commands.
+
+inline FormattedCommand psubscribe(const StringView &pattern) {
+    return format_cmd("PSUBSCRIBE %b", pattern.data(), pattern.size());
+}
+
+template <typename Input>
+inline FormattedCommand psubscribe_range(Input first, Input last) {
+    assert(first != last);
+
+    CmdArgs args;
+    args << "PSUBSCRIBE" << std::make_pair(first, last);
+
+    return format_cmd(args);
+}
+
+inline FormattedCommand publish(const StringView &channel, const StringView &message) {
+    return format_cmd("PUBLISH %b %b",
+                    channel.data(), channel.size(),
+                    message.data(), message.size());
+}
+
+inline FormattedCommand punsubscribe() {
+    return format_cmd("PUNSUBSCRIBE");
+}
+
+inline FormattedCommand punsubscribe(const StringView &pattern) {
+    return format_cmd("PUNSUBSCRIBE %b", pattern.data(), pattern.size());
+}
+
+template <typename Input>
+inline FormattedCommand punsubscribe_range(Input first, Input last) {
+    assert(first != last);
+
+    CmdArgs args;
+    args << "PUNSUBSCRIBE" << std::make_pair(first, last);
+
+    return format_cmd(args);
+}
+
+inline FormattedCommand subscribe(const StringView &channel) {
+    return format_cmd("SUBSCRIBE %b", channel.data(), channel.size());
+}
+
+template <typename Input>
+inline FormattedCommand subscribe_range(Input first, Input last) {
+    assert(first != last);
+
+    CmdArgs args;
+    args << "SUBSCRIBE" << std::make_pair(first, last);
+
+    return format_cmd(args);
+}
+
+inline FormattedCommand unsubscribe() {
+    return format_cmd("UNSUBSCRIBE");
+}
+
+inline FormattedCommand unsubscribe(const StringView &channel) {
+    return format_cmd("UNSUBSCRIBE %b", channel.data(), channel.size());
+}
+
+template <typename Input>
+inline FormattedCommand unsubscribe_range(Input first, Input last) {
+    assert(first != last);
+
+    CmdArgs args;
+    args << "UNSUBSCRIBE" << std::make_pair(first, last);
 
     return format_cmd(args);
 }

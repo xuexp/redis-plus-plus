@@ -22,6 +22,7 @@
 #include "async_connection.h"
 #include "async_connection_pool.h"
 #include "async_shards_pool.h"
+#include "async_subscriber.h"
 #include "event_loop.h"
 #include "cmd_formatter.h"
 
@@ -42,17 +43,32 @@ public:
     AsyncRedisCluster(AsyncRedisCluster &&) = default;
     AsyncRedisCluster& operator=(AsyncRedisCluster &&) = default;
 
-    ~AsyncRedisCluster() = default;
+    ~AsyncRedisCluster();
+
+    AsyncSubscriber subscriber();
 
     template <typename Result, typename ...Args>
-    Future<Result> command(const StringView &cmd_name, const StringView &key, Args &&...args) {
-        auto formatter = [&cmd_name](const StringView &key, Args &&...args) {
+    auto command(const StringView &cmd_name, const StringView &key, Args &&...args)
+        -> typename std::enable_if<!IsInvocable<typename LastType<Args...>::type,
+                                        Future<Result> &&>::value, Future<Result>>::type {
+        auto formatter = [&cmd_name](const StringView &k, Args &&...params) {
             CmdArgs cmd_args;
-            cmd_args.append(cmd_name, key, std::forward<Args>(args)...);
+            cmd_args.append(cmd_name, k, std::forward<Args>(params)...);
             return fmt::format_cmd(cmd_args);
         };
 
         return _command<Result>(formatter, key, std::forward<Args>(args)...);
+    }
+
+    template <typename Result, typename ...Args>
+    auto command(const StringView &cmd_name, const StringView &key, Args &&...args)
+        -> typename std::enable_if<IsInvocable<typename LastType<Args...>::type,
+                                        Future<Result> &&>::value, void>::type {
+        _callback_idx_command<Result>(LastValue(std::forward<Args>(args)...),
+                cmd_name,
+                key,
+                MakeIndexSequence<sizeof...(Args) - 1>(),
+                std::forward<Args>(args)...);
     }
 
     template <typename Result, typename Input>
@@ -65,12 +81,12 @@ public:
         const auto &cmd_name = *first;
         ++first;
 
-        auto formatter = [&cmd_name](Input first, Input last) {
+        auto formatter = [&cmd_name](Input start, Input stop) {
             CmdArgs cmd_args;
             cmd_args.append(cmd_name);
-            while (first != last) {
-                cmd_args.append(*first);
-                ++first;
+            while (start != stop) {
+                cmd_args.append(*start);
+                ++start;
             }
             return fmt::format_cmd(cmd_args);
         };
@@ -78,10 +94,39 @@ public:
         return _command<Result>(formatter, first, last);
     }
 
+    template <typename Result, typename Input, typename Callback>
+    auto command(Input first, Input last, Callback &&cb)
+        -> typename std::enable_if<IsIter<Input>::value, void>::type {
+        if (first == last || std::next(first) == last) {
+            throw Error("command: invalid range");
+        }
+
+        const auto &cmd_name = *first;
+        ++first;
+
+        auto formatter = [&cmd_name](Input start, Input stop) {
+            CmdArgs cmd_args;
+            cmd_args.append(cmd_name);
+            while (start != stop) {
+                cmd_args.append(*start);
+                ++start;
+            }
+            return fmt::format_cmd(cmd_args);
+        };
+
+        _callback_fmt_command<Result>(std::forward<Callback>(cb), formatter, first, last);
+    }
+
     // CONNECTION commands.
 
     Future<long long> del(const StringView &key) {
         return _command<long long>(fmt::del, key);
+    }
+
+    template <typename Callback>
+    auto del(const StringView &key, Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<long long> &&>::value, void>::type {
+        _callback_fmt_command<long long>(std::forward<Callback>(cb), fmt::del, key);
     }
 
     template <typename Input>
@@ -91,9 +136,23 @@ public:
         return _command<long long>(fmt::del_range<Input>, first, last);
     }
 
+    template <typename Input, typename Callback>
+    auto del(Input first, Input last, Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<long long> &&>::value, void>::type {
+        range_check("DEL", first, last);
+
+        _callback_fmt_command<long long>(std::forward<Callback>(cb), fmt::del_range<Input>, first, last);
+    }
+
     template <typename T>
     Future<long long> del(std::initializer_list<T> il) {
         return del(il.begin(), il.end());
+    }
+
+    template <typename T, typename Callback>
+    auto del(std::initializer_list<T> il, Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<long long> &&>::value, void>::type {
+        del<decltype(il.begin()), Callback>(il.begin(), il.end(), std::forward<Callback>(cb));
     }
 
     Future<long long> exists(const StringView &key) {
@@ -166,8 +225,17 @@ public:
 
     // STRING commands.
 
+    Future<long long> append(const StringView &key, const StringView &str) {
+        return _command<long long>(fmt::append, key, str);
+    }
+
     Future<OptionalString> get(const StringView &key) {
         return _command<OptionalString>(fmt::get, key);
+    }
+
+    template <typename Callback>
+    void get(const StringView &key, Callback &&cb) {
+        _callback_fmt_command<OptionalString>(std::forward<Callback>(cb), fmt::get, key);
     }
 
     Future<long long> incr(const StringView &key) {
@@ -224,6 +292,70 @@ public:
                 UpdateType type = UpdateType::ALWAYS) {
         return _command_with_parser<bool, fmt::SetResultParser>(fmt::set,
                 key, key, val, ttl, type);
+    }
+
+    template <typename Callback>
+    auto set(const StringView &key,
+                const StringView &val,
+                Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<bool> &&>::value, void>::type {
+        _callback_command_with_parser<bool, fmt::SetResultParser>(
+                std::forward<Callback>(cb), fmt::set,
+                key, key, val, std::chrono::milliseconds(0), UpdateType::ALWAYS);
+    }
+
+    template <typename Callback>
+    auto set(const StringView &key,
+                const StringView &val,
+                const std::chrono::milliseconds &ttl,
+                Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<bool> &&>::value, void>::type {
+        _callback_command_with_parser<bool, fmt::SetResultParser>(
+                std::forward<Callback>(cb), fmt::set,
+                key, key, val, ttl, UpdateType::ALWAYS);
+    }
+
+    template <typename Callback>
+    auto set(const StringView &key,
+                const StringView &val,
+                const std::chrono::milliseconds &ttl,
+                UpdateType type,
+                Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<bool> &&>::value, void>::type {
+        _callback_command_with_parser<bool, fmt::SetResultParser>(
+                std::forward<Callback>(cb), fmt::set,
+                key, key, val, ttl, type);
+    }
+
+    Future<bool> set(const StringView &key,
+                const StringView &val,
+                bool keepttl,
+                UpdateType type = UpdateType::ALWAYS) {
+        return _command_with_parser<bool, fmt::SetResultParser>(fmt::set_keepttl,
+                key, key, val, keepttl, type);
+    }
+
+    template <typename Callback>
+    auto set(const StringView &key,
+                const StringView &val,
+                bool keepttl,
+                Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<bool> &&>::value, void>::type {
+        _callback_command_with_parser<bool, fmt::SetResultParser>(
+                std::forward<Callback>(cb), fmt::set_keepttl,
+                key, key, val, keepttl, UpdateType::ALWAYS);
+    }
+
+    template <typename Callback>
+    auto set(const StringView &key,
+                const StringView &val,
+                bool keepttl,
+                UpdateType type,
+                Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<bool> &&>::value, void>::type {
+        _callback_command_with_parser<bool, fmt::SetResultParser>(
+                std::forward<Callback>(cb), fmt::set_keepttl,
+                key, key, val, keepttl, type);
     }
 
     Future<long long> strlen(const StringView &key) {
@@ -345,6 +477,12 @@ public:
         return _command<long long>(fmt::hdel, key, field);
     }
 
+    template <typename Callback>
+    auto hdel(const StringView &key, const StringView &field, Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<long long> &&>::value, void>::type {
+        _callback_fmt_command<long long>(std::forward<Callback>(cb), fmt::hdel, key, field);
+    }
+
     template <typename Input>
     Future<long long> hdel(const StringView &key, Input first, Input last) {
         range_check("HDEL", first, last);
@@ -352,9 +490,23 @@ public:
         return _command<long long>(fmt::hdel_range<Input>, key, first, last);
     }
 
+    template <typename Input, typename Callback>
+    auto hdel(const StringView &key, Input first, Input last, Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<long long> &&>::value, void>::type {
+        range_check("HDEL", first, last);
+
+        _callback_fmt_command<long long>(std::forward<Callback>(cb), fmt::hdel_range<Input>, key, first, last);
+    }
+
     template <typename T>
     Future<long long> hdel(const StringView &key, std::initializer_list<T> il) {
         return hdel(key, il.begin(), il.end());
+    }
+
+    template <typename T, typename Callback>
+    auto hdel(const StringView &key, std::initializer_list<T> il, Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<long long> &&>::value, void>::type {
+        hdel<decltype(il.begin()), Callback>(key, il.begin(), il.end(), std::forward<Callback>(cb));
     }
 
     Future<bool> hexists(const StringView &key, const StringView &field) {
@@ -365,9 +517,19 @@ public:
         return _command<OptionalString>(fmt::hget, key, field);
     }
 
+    template <typename Callback>
+    void hget(const StringView &key, const StringView &field, Callback &&cb) {
+        _callback_fmt_command<OptionalString>(std::forward<Callback>(cb), fmt::hget, key, field);
+    }
+
     template <typename Output>
     Future<Output> hgetall(const StringView &key) {
         return _command<Output>(fmt::hgetall, key);
+    }
+
+    template <typename Output, typename Callback>
+    void hgetall(const StringView &key, Callback &&cb) {
+        _callback_fmt_command<Output>(std::forward<Callback>(cb), fmt::hgetall, key);
     }
 
     Future<long long> hincrby(const StringView &key, const StringView &field, long long increment) {
@@ -415,8 +577,20 @@ public:
         return _command<bool>(fmt::hset, key, field, val);
     }
 
+    template <typename Callback>
+    auto hset(const StringView &key, const StringView &field, const StringView &val, Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<long long> &&>::value, void>::type {
+        _callback_fmt_command<long long>(std::forward<Callback>(cb), fmt::hset, key, field, val);
+    }
+
     Future<bool> hset(const StringView &key, const std::pair<StringView, StringView> &item) {
         return hset(key, item.first, item.second);
+    }
+
+    template <typename Callback>
+    auto hset(const StringView &key, const std::pair<StringView, StringView> &item, Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<long long> &&>::value, void>::type {
+        hset<Callback>(key, item.first, item.second, std::forward<Callback>(cb));
     }
 
     template <typename Input>
@@ -427,9 +601,24 @@ public:
         return _command<long long>(fmt::hset_range<Input>, key, first, last);
     }
 
+    template <typename Input, typename Callback>
+    auto hset(const StringView &key, Input first, Input last, Callback &&cb)
+        -> typename std::enable_if<!std::is_convertible<Input, StringView>::value &&
+            IsInvocable<typename std::decay<Callback>::type, Future<long long> &&>::value, void>::type {
+        range_check("HSET", first, last);
+
+        _callback_fmt_command<long long>(std::forward<Callback>(cb), fmt::hset_range<Input>, key, first, last);
+    }
+
     template <typename T>
     Future<long long> hset(const StringView &key, std::initializer_list<T> il) {
         return hset(key, il.begin(), il.end());
+    }
+
+    template <typename T, typename Callback>
+    auto hset(const StringView &key, std::initializer_list<T> il, Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<long long> &&>::value, void>::type {
+        hset<decltype(il.begin()), Callback>(key, il.begin(), il.end(), std::forward<Callback>(cb));
     }
 
     template <typename Output>
@@ -443,6 +632,12 @@ public:
         return _command<long long>(fmt::sadd, key, member);
     }
 
+    template <typename Callback>
+    auto sadd(const StringView &key, const StringView &member, Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<long long> &&>::value, void>::type {
+        _callback_fmt_command<long long>(std::forward<Callback>(cb), fmt::sadd, key, member);
+    }
+
     template <typename Input>
     Future<long long> sadd(const StringView &key, Input first, Input last) {
         range_check("SADD", first, last);
@@ -450,9 +645,23 @@ public:
         return _command<long long>(fmt::sadd_range<Input>, key, first, last);
     }
 
+    template <typename Input, typename Callback>
+    auto sadd(const StringView &key, Input first, Input last, Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<long long> &&>::value, void>::type {
+        range_check("SADD", first, last);
+
+        _callback_fmt_command<long long>(std::forward<Callback>(cb), fmt::sadd_range<Input>, key, first, last);
+    }
+
     template <typename T>
     Future<long long> sadd(const StringView &key, std::initializer_list<T> il) {
         return sadd(key, il.begin(), il.end());
+    }
+
+    template <typename T, typename Callback>
+    auto sadd(const StringView &key, std::initializer_list<T> il, Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<long long> &&>::value, void>::type {
+        sadd<decltype(il.begin()), Callback>(key, il.begin(), il.end(), std::forward<Callback>(cb));
     }
 
     Future<long long> scard(const StringView &key) {
@@ -463,9 +672,19 @@ public:
         return _command<bool>(fmt::sismember, key, member);
     }
 
+    template <typename Callback>
+    void sismember(const StringView &key, const StringView &member, Callback &&cb) {
+        _callback_fmt_command<bool>(std::forward<Callback>(cb), fmt::sismember, key, member);
+    }
+
     template <typename Output>
     Future<Output> smembers(const StringView &key) {
         return _command<Output>(fmt::smembers, key);
+    }
+
+    template <typename Output, typename Callback>
+    void smembers(const StringView &key, Callback &&cb) {
+        _callback_fmt_command<Output>(std::forward<Callback>(cb), fmt::smembers, key);
     }
 
     Future<OptionalString> spop(const StringView &key) {
@@ -482,6 +701,12 @@ public:
         return _command<long long>(fmt::srem, key, member);
     }
 
+    template <typename Callback>
+    auto srem(const StringView &key, const StringView &member, Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<long long> &&>::value, void>::type {
+        _callback_fmt_command<long long>(std::forward<Callback>(cb), fmt::srem, key, member);
+    }
+
     template <typename Input>
     Future<long long> srem(const StringView &key, Input first, Input last) {
         range_check("SREM", first, last);
@@ -489,9 +714,23 @@ public:
         return _command<long long>(fmt::srem_range<Input>, key, first, last);
     }
 
+    template <typename Input, typename Callback>
+    auto srem(const StringView &key, Input first, Input last, Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<long long> &&>::value, void>::type {
+        range_check("SREM", first, last);
+
+        _callback_fmt_command<long long>(std::forward<Callback>(cb), fmt::srem_range<Input>, key, first, last);
+    }
+
     template <typename T>
     Future<long long> srem(const StringView &key, std::initializer_list<T> il) {
         return srem(key, il.begin(), il.end());
+    }
+
+    template <typename T, typename Callback>
+    auto srem(const StringView &key, std::initializer_list<T> il, Callback &&cb)
+        -> typename std::enable_if<IsInvocable<typename std::decay<Callback>::type, Future<long long> &&>::value, void>::type {
+        srem<decltype(il.begin()), Callback>(key, il.begin(), il.end(), std::forward<Callback>(cb));
     }
 
     // SORTED SET commands.
@@ -746,6 +985,38 @@ public:
                 args.begin(), args.end());
     }
 
+    // PUBSUB commands.
+
+    Future<long long> publish(const StringView &channel, const StringView &message) {
+        return _command<long long>(fmt::publish, channel, message);
+    }
+
+    template <typename Callback>
+    void publish(const StringView &channel, const StringView &message, Callback &&cb) {
+        _callback_fmt_command<long long>(std::forward<Callback>(cb), fmt::publish, channel, message);
+    }
+
+    // co_command* are used internally. DO NOT use them.
+
+    template <typename Result, typename Callback>
+    void co_command(const StringView &key, FormattedCommand cmd, Callback &&cb) {
+        co_command_with_parser<Result, DefaultResultParser<Result>, Callback>(
+                key, std::move(cmd), std::forward<Callback>(cb));
+    }
+
+    template <typename Result, typename ResultParser, typename Callback>
+    void co_command_with_parser(const StringView &key, FormattedCommand cmd, Callback &&cb) {
+        assert(_pool);
+
+        auto pool = _pool->fetch(key);
+        assert(pool);
+
+        GuardedAsyncConnection connection(pool);
+
+        connection.connection().send<Result, ResultParser, Callback>(
+                _pool, key, std::move(cmd), std::forward<Callback>(cb));
+    }
+
 private:
     template <typename Result, typename ResultParser,
              typename Formatter, typename ...Args>
@@ -807,7 +1078,91 @@ private:
                 std::forward<Input>(input), std::forward<Args>(args)...);
     }
 
+    template <typename Result, typename Callback, std::size_t ...Is, typename ...Args>
+    void _callback_idx_command(Callback &&cb, const StringView &cmd_name, const StringView &key,
+            const IndexSequence<Is...> &, Args &&...args) {
+        _callback_command<Result>(std::forward<Callback>(cb), cmd_name, key,
+                NthValue<Is>(std::forward<Args>(args)...)...);
+    }
+
+    template <typename Result, typename Callback, typename ...Args>
+    void _callback_command(Callback &&cb, const StringView &cmd_name,
+            const StringView &key, Args &&...args) {
+        auto formatter = [&cmd_name](const StringView &k, Args &&...params) {
+            CmdArgs cmd_args;
+            cmd_args.append(cmd_name, k, std::forward<Args>(params)...);
+            return fmt::format_cmd(cmd_args);
+        };
+
+        _callback_fmt_command<Result>(std::forward<Callback>(cb), formatter, key,
+                std::forward<Args>(args)...);
+    }
+
+    template <typename Result, typename Callback, typename Formatter, typename Key, typename ...Args>
+    void _callback_fmt_command(Callback &&cb, Formatter formatter, Key &&key, Args &&...args) {
+        _callback_generic_command<Result>(std::forward<Callback>(cb),
+                formatter,
+                std::is_convertible<typename std::decay<Key>::type, StringView>(),
+                std::forward<Key>(key),
+                std::forward<Args>(args)...);
+    }
+
+    template <typename Result, typename Callback, typename Formatter, typename ...Args>
+    void _callback_generic_command(Callback &&cb, Formatter formatter, std::true_type,
+            const StringView &key, Args &&...args) {
+        _callback_generic_command<Result>(std::forward<Callback>(cb), formatter, key, key, std::forward<Args>(args)...);
+    }
+
+    template <typename Result, typename Callback, typename Formatter, typename Input, typename ...Args>
+    void _callback_generic_command(Callback &&cb, Formatter formatter, std::false_type, Input &&input, Args &&...args) {
+        _callback_range_command<Result>(std::forward<Callback>(cb),
+                formatter,
+                std::is_convertible<typename std::decay<
+                    decltype(*std::declval<Input>())>::type, StringView>(),
+                std::forward<Input>(input),
+                std::forward<Args>(args)...);
+    }
+
+    template <typename Result, typename Callback, typename Formatter, typename ...Args>
+    void _callback_generic_command(Callback &&cb, Formatter formatter, const StringView &key, Args &&...args) {
+        return _callback_command_with_parser<Result, DefaultResultParser<Result>, Callback>(
+                std::forward<Callback>(cb), formatter, key, std::forward<Args>(args)...);
+    }
+
+    template <typename Result, typename ResultParser, typename Callback,
+             typename Formatter, typename ...Args>
+    void _callback_command_with_parser(Callback &&cb, Formatter formatter,
+            const StringView &key, Args &&...args) {
+        auto formatted_cmd = formatter(std::forward<Args>(args)...);
+
+        assert(_pool);
+
+        auto pool = _pool->fetch(key);
+        assert(pool);
+
+        GuardedAsyncConnection connection(pool);
+
+        return connection.connection().send<Result, ResultParser, Callback>(
+                _pool, key, std::move(formatted_cmd), std::forward<Callback>(cb));
+    }
+
+    template <typename Result, typename Callback, typename Formatter, typename Input, typename ...Args>
+    void _callback_range_command(Callback &&cb, Formatter formatter, std::true_type,
+            Input &&input, Args &&...args) {
+        _callback_generic_command<Result>(std::forward<Callback>(cb), formatter, *input,
+                std::forward<Input>(input), std::forward<Args>(args)...);
+    }
+
+    template <typename Result, typename Callback, typename Formatter, typename Input, typename ...Args>
+    void _callback_range_command(Callback &&cb, Formatter formatter, std::false_type,
+            Input &&input, Args &&...args) {
+        _callback_generic_command<Result>(std::forward<Callback>(cb), formatter, std::get<0>(*input),
+                std::forward<Input>(input), std::forward<Args>(args)...);
+    }
+
     EventLoopSPtr _loop;
+
+    bool _own_loop{false};
 
     AsyncShardsPoolSPtr _pool;
 };
