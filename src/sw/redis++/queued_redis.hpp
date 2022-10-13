@@ -78,9 +78,9 @@ auto QueuedRedis<Impl>::command(Cmd cmd, Args &&...args)
 template <typename Impl>
 template <typename ...Args>
 QueuedRedis<Impl>& QueuedRedis<Impl>::command(const StringView &cmd_name, Args &&...args) {
-    auto cmd = [](Connection &connection, const StringView &cmd_name, Args &&...args) {
+    auto cmd = [](Connection &connection, const StringView &name, Args &&...params) {
                     CmdArgs cmd_args;
-                    cmd_args.append(cmd_name, std::forward<Args>(args)...);
+                    cmd_args.append(name, std::forward<Args>(params)...);
                     connection.send(cmd_args);
     };
 
@@ -95,11 +95,11 @@ auto QueuedRedis<Impl>::command(Input first, Input last)
         throw Error("command: empty range");
     }
 
-    auto cmd = [](Connection &connection, Input first, Input last) {
+    auto cmd = [](Connection &connection, Input start, Input stop) {
                     CmdArgs cmd_args;
-                    while (first != last) {
-                        cmd_args.append(*first);
-                        ++first;
+                    while (start != stop) {
+                        cmd_args.append(*start);
+                        ++start;
                     }
                     connection.send(cmd_args);
     };
@@ -116,9 +116,12 @@ QueuedReplies QueuedRedis<Impl>::exec() {
 
         _rewrite_replies(replies);
 
+        std::unordered_set<std::size_t> set_cmd_indexes;
+        set_cmd_indexes.swap(_set_cmd_indexes);
+
         _reset();
 
-        return QueuedReplies(std::move(replies));
+        return QueuedReplies(std::move(replies), std::move(set_cmd_indexes));
     } catch (const WatchError &e) {
         // In this case, we only clear some states and keep the connection,
         // so that user can retry the transaction.
@@ -209,8 +212,6 @@ void QueuedRedis<Impl>::_clean_up() {
 
 template <typename Impl>
 void QueuedRedis<Impl>::_rewrite_replies(std::vector<ReplyUPtr> &replies) const {
-    _rewrite_replies(_set_cmd_indexes, reply::rewrite_set_reply, replies);
-
     _rewrite_replies(_empty_array_cmd_indexes, reply::rewrite_empty_array_reply, replies);
 }
 
@@ -246,13 +247,6 @@ inline redisReply& QueuedReplies::get(std::size_t idx) {
     }
 
     return *reply;
-}
-
-template <typename Result>
-inline Result QueuedReplies::get(std::size_t idx) {
-    auto &reply = get(idx);
-
-    return reply::parse<Result>(reply);
 }
 
 template <typename Output>

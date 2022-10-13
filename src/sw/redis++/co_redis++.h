@@ -1,5 +1,5 @@
 /**************************************************************************
-   Copyright (c) 2021 sewenew
+   Copyright (c) 2022 sewenew
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -14,37 +14,10 @@
    limitations under the License.
  *************************************************************************/
 
-#ifndef SEWENEW_REDISPLUSPLUS_CXX_UTILS_H
-#define SEWENEW_REDISPLUSPLUS_CXX_UTILS_H
+#ifndef SEWENEW_REDISPLUSPLUS_CO_REDISPLUSPLUS_H
+#define SEWENEW_REDISPLUSPLUS_CO_REDISPLUSPLUS_H
 
-#include <string_view>
-#include <type_traits>
-#include <optional>
-#include <variant>
+#include "co_redis.h"
+#include "co_redis_cluster.h"
 
-#define REDIS_PLUS_PLUS_HAS_OPTIONAL
-
-#define REDIS_PLUS_PLUS_HAS_VARIANT
-
-namespace sw {
-
-namespace redis {
-
-using StringView = std::string_view;
-
-template <typename T>
-using Optional = std::optional<T>;
-
-template <typename ...Args>
-using Variant = std::variant<Args...>;
-
-using Monostate = std::monostate;
-
-template <typename F, typename ...Args>
-using IsInvocable = std::is_invocable<F, Args...>;
-
-}
-
-}
-
-#endif // end SEWENEW_REDISPLUSPLUS_CXX_UTILS_H
+#endif // end SEWENEW_REDISPLUSPLUS_CO_REDISPLUSPLUS_H
